@@ -1,0 +1,222 @@
+# Anker Solix Tibber Sturing
+# ============================================================================
+# Standaardmodus van de Anker Solix in de app = "smart".
+#
+# Logica:
+#   - Laden:    1.5 uur voor t/m 1.5 uur na het GOEDKOOPSTE Tibber-slot vandaag
+#               (mode = manual, output = 0 W, backup_option = aan, export = uit)
+#               daarna terug naar "smart".
+#   - Ontladen: 1.0 uur voor t/m 1.0 uur na het DUURSTE Tibber-slot vandaag
+#               (mode = manual, allow_grid_export = aan, output = max W)
+#               daarna terug naar "smart".
+#   - Als laad- en ontlaadvenster elkaar overlappen: niks doen, smart blijft.
+# ============================================================================
+
+template:
+  # ---- Tijdstippen van goedkoopste en duurste slot van vandaag ----
+  - sensor:
+      - name: "Solix Goedkoopste Slot"
+        unique_id: solix_cheapest_slot
+        device_class: timestamp
+        state: >
+          {% set prices = state_attr('sensor.tibber_smart_prices_today', 'prices_today') %}
+          {% if prices and prices | length > 0 %}
+            {{ as_datetime((prices | sort(attribute='price') | first).start).isoformat() }}
+          {% else %}
+            {{ None }}
+          {% endif %}
+
+      - name: "Solix Duurste Slot"
+        unique_id: solix_most_expensive_slot
+        device_class: timestamp
+        state: >
+          {% set prices = state_attr('sensor.tibber_smart_prices_today', 'prices_today') %}
+          {% if prices and prices | length > 0 %}
+            {{ as_datetime((prices | sort(attribute='price', reverse=true) | first).start).isoformat() }}
+          {% else %}
+            {{ None }}
+          {% endif %}
+
+  # ---- Binary sensors: ben ik nu in een venster? Overlappen ze? ----
+  - binary_sensor:
+      - name: "Solix Laadvenster Actief"
+        unique_id: solix_charge_window_active
+        state: >
+          {% set cheap = states('sensor.solix_goedkoopste_slot') %}
+          {% if cheap not in ['unknown', 'unavailable', 'none', None] %}
+            {% set cheap_ts = as_timestamp(cheap) %}
+            {% set now_ts = now().timestamp() %}
+            {{ (cheap_ts - 5400) <= now_ts <= (cheap_ts + 5400) }}
+          {% else %}
+            false
+          {% endif %}
+        icon: mdi:battery-charging
+
+      - name: "Solix Ontlaadvenster Actief"
+        unique_id: solix_discharge_window_active
+        state: >
+          {% set exp = states('sensor.solix_duurste_slot') %}
+          {% if exp not in ['unknown', 'unavailable', 'none', None] %}
+            {% set exp_ts = as_timestamp(exp) %}
+            {% set now_ts = now().timestamp() %}
+            {{ (exp_ts - 3600) <= now_ts <= (exp_ts + 3600) }}
+          {% else %}
+            false
+          {% endif %}
+        icon: mdi:battery-arrow-down
+
+      - name: "Solix Vensters Overlappen"
+        unique_id: solix_windows_overlap
+        state: >
+          {% set cheap = states('sensor.solix_goedkoopste_slot') %}
+          {% set exp = states('sensor.solix_duurste_slot') %}
+          {% if cheap not in ['unknown', 'unavailable', 'none', None]
+             and exp not in ['unknown', 'unavailable', 'none', None] %}
+            {% set cheap_ts = as_timestamp(cheap) %}
+            {% set exp_ts = as_timestamp(exp) %}
+            {% set charge_start = cheap_ts - 5400 %}
+            {% set charge_end = cheap_ts + 5400 %}
+            {% set disc_start = exp_ts - 3600 %}
+            {% set disc_end = exp_ts + 3600 %}
+            {{ charge_start < disc_end and disc_start < charge_end }}
+          {% else %}
+            false
+          {% endif %}
+        icon: mdi:alert-circle
+
+automation:
+  # =========================================================================
+  # LADEN START — venster gaat open, geen overlap met ontladen
+  # =========================================================================
+  - id: solix_charge_start
+    alias: "Solix: Start laden (goedkoopste prijs)"
+    description: "Laadt batterij rond goedkoopste Tibber slot"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.solix_laadvenster_actief
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: binary_sensor.solix_vensters_overlappen
+        state: "off"
+    action:
+      - service: select.select_option
+        target:
+          entity_id: select.solarbank_3_e2700_pro_usage_mode_2
+        data:
+          option: "manual"
+      - delay: "00:00:02"
+      - service: switch.turn_off
+        target:
+          entity_id: switch.solarbank_3_e2700_pro_allow_grid_export
+      - service: number.set_value
+        target:
+          entity_id: number.solarbank_3_e2700_pro_system_output_preset_2
+        data:
+          value: 0
+      - service: switch.turn_on
+        target:
+          entity_id: switch.solarbank_3_e2700_pro_backup_option_2
+      - service: logbook.log
+        data:
+          name: "Anker Solix"
+          message: >
+            LADEN GESTART (€{{ states('sensor.tibber_smart_current_price') }}/kWh) —
+            venster {{ (as_timestamp(states('sensor.solix_goedkoopste_slot')) - 5400) | timestamp_custom('%H:%M') }}
+            tot {{ (as_timestamp(states('sensor.solix_goedkoopste_slot')) + 5400) | timestamp_custom('%H:%M') }}
+          entity_id: switch.solarbank_3_e2700_pro_backup_option_2
+    mode: single
+
+  # =========================================================================
+  # LADEN STOP — venster sluit, terug naar smart
+  # =========================================================================
+  - id: solix_charge_stop
+    alias: "Solix: Stop laden, terug naar smart"
+    description: "Beëindigt laadvenster en zet Anker terug op smart"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.solix_laadvenster_actief
+        to: "off"
+    action:
+      - service: switch.turn_off
+        target:
+          entity_id: switch.solarbank_3_e2700_pro_backup_option_2
+      - service: select.select_option
+        target:
+          entity_id: select.solarbank_3_e2700_pro_usage_mode_2
+        data:
+          option: "smart"
+      - service: logbook.log
+        data:
+          name: "Anker Solix"
+          message: "LADEN GESTOPT — terug naar smart modus"
+          entity_id: switch.solarbank_3_e2700_pro_backup_option_2
+    mode: single
+
+  # =========================================================================
+  # ONTLADEN START — venster gaat open, geen overlap met laden
+  # =========================================================================
+  - id: solix_discharge_start
+    alias: "Solix: Start ontladen (duurste prijs)"
+    description: "Maximaal ontladen rond duurste Tibber slot"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.solix_ontlaadvenster_actief
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: binary_sensor.solix_vensters_overlappen
+        state: "off"
+    action:
+      - service: select.select_option
+        target:
+          entity_id: select.solarbank_3_e2700_pro_usage_mode_2
+        data:
+          option: "manual"
+      - delay: "00:00:02"
+      - service: switch.turn_off
+        target:
+          entity_id: switch.solarbank_3_e2700_pro_backup_option_2
+      - service: switch.turn_on
+        target:
+          entity_id: switch.solarbank_3_e2700_pro_allow_grid_export
+      - service: number.set_value
+        target:
+          entity_id: number.solarbank_3_e2700_pro_system_output_preset_2
+        data:
+          value: 2400
+      - service: logbook.log
+        data:
+          name: "Anker Solix"
+          message: >
+            ONTLADEN MAX (€{{ states('sensor.tibber_smart_current_price') }}/kWh) —
+            venster {{ (as_timestamp(states('sensor.solix_duurste_slot')) - 3600) | timestamp_custom('%H:%M') }}
+            tot {{ (as_timestamp(states('sensor.solix_duurste_slot')) + 3600) | timestamp_custom('%H:%M') }}
+          entity_id: number.solarbank_3_e2700_pro_system_output_preset_2
+    mode: single
+
+  # =========================================================================
+  # ONTLADEN STOP — venster sluit, terug naar smart
+  # =========================================================================
+  - id: solix_discharge_stop
+    alias: "Solix: Stop ontladen, terug naar smart"
+    description: "Beëindigt ontlaadvenster en zet Anker terug op smart"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.solix_ontlaadvenster_actief
+        to: "off"
+    action:
+      - service: switch.turn_off
+        target:
+          entity_id: switch.solarbank_3_e2700_pro_allow_grid_export
+      - service: select.select_option
+        target:
+          entity_id: select.solarbank_3_e2700_pro_usage_mode_2
+        data:
+          option: "smart"
+      - service: logbook.log
+        data:
+          name: "Anker Solix"
+          message: "ONTLADEN GESTOPT — terug naar smart modus"
+          entity_id: number.solarbank_3_e2700_pro_system_output_preset_2
+    mode: single

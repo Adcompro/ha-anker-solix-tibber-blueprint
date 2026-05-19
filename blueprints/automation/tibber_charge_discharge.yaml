@@ -1,0 +1,320 @@
+blueprint:
+  name: Anker Solix - Tibber slim laden en terugleveren
+  description: |
+    Stuurt een Anker Solarbank (via de [Anker Solix custom integration](https://github.com/thomluther/ha-anker-solix))
+    automatisch op basis van Tibber-prijzen.
+
+    **Logica**
+    - **Laden uit het net**: rond het GOEDKOOPSTE Tibber slot van vandaag.
+      Standaard 1,5 uur ervoor t/m 1,5 uur erna. Solarbank gaat tijdelijk naar
+      `manual` mode, `allow_grid_export` uit, output 0 W, `backup_option` aan.
+    - **Ontladen naar het net**: rond het DUURSTE Tibber slot van vandaag.
+      Standaard 1 uur ervoor t/m 1 uur erna. Solarbank naar `manual`,
+      `backup_option` uit, `allow_grid_export` aan, output op gekozen max W.
+    - **Overlap**: als laad- en ontlaadvenster elkaar raken gebeurt er niks,
+      de Solarbank blijft in `smart` modus.
+    - Buiten de vensters: terug naar `smart` modus zodat de Anker app/eigen
+      logica weer balanceert.
+
+    **Vereisten**
+    - Een prijs-sensor met een attribuut dat een lijst van objecten bevat met
+      `start` (ISO timestamp) en `price` (float). Werkt out-of-the-box met
+      Tibber Smart (`sensor.tibber_smart_prices_today` / attribute
+      `prices_today`). Voor andere integraties geef de juiste attribuut-naam op.
+
+    De automatisering checkt elke minuut + bij prijs-updates en stuurt alleen
+    bij als er iets moet veranderen (idempotent).
+
+  domain: automation
+  source_url: https://github.com/Adcompro/ha-anker-solix-tibber-blueprint/blob/main/blueprints/automation/tibber_charge_discharge.yaml
+  input:
+    prices_sensor:
+      name: Prijzen-sensor
+      description: Sensor met een attribuut dat een lijst {start, price} bevat (bijv. sensor.tibber_smart_prices_today)
+      selector:
+        entity:
+          domain: sensor
+    prices_attribute:
+      name: Naam van het prijzen-attribuut
+      description: Bijv. "prices_today" voor Tibber Smart
+      default: prices_today
+      selector:
+        text: {}
+
+    usage_mode_select:
+      name: Solarbank usage mode select
+      description: Bijv. select.solarbank_3_e2700_pro_usage_mode_2
+      selector:
+        entity:
+          domain: select
+    smart_mode_option:
+      name: Optie-tekst voor "smart" modus
+      default: smart
+      selector:
+        text: {}
+    manual_mode_option:
+      name: Optie-tekst voor "manual" modus
+      default: manual
+      selector:
+        text: {}
+
+    output_preset_number:
+      name: Solarbank output preset (W)
+      description: Bijv. number.solarbank_3_e2700_pro_system_output_preset_2
+      selector:
+        entity:
+          domain: number
+    backup_option_switch:
+      name: Solarbank backup option switch (AC laden vanaf net)
+      description: Bijv. switch.solarbank_3_e2700_pro_backup_option_2
+      selector:
+        entity:
+          domain: switch
+    grid_export_switch:
+      name: Solarbank allow grid export switch
+      description: Bijv. switch.solarbank_3_e2700_pro_allow_grid_export
+      selector:
+        entity:
+          domain: switch
+
+    charge_hours_before:
+      name: Uren VOOR goedkoopste slot starten met laden
+      default: 1.5
+      selector:
+        number:
+          min: 0
+          max: 6
+          step: 0.25
+          unit_of_measurement: u
+          mode: slider
+    charge_hours_after:
+      name: Uren NA goedkoopste slot blijven laden
+      default: 1.5
+      selector:
+        number:
+          min: 0
+          max: 6
+          step: 0.25
+          unit_of_measurement: u
+          mode: slider
+    discharge_hours_before:
+      name: Uren VOOR duurste slot starten met ontladen
+      default: 1.0
+      selector:
+        number:
+          min: 0
+          max: 6
+          step: 0.25
+          unit_of_measurement: u
+          mode: slider
+    discharge_hours_after:
+      name: Uren NA duurste slot blijven ontladen
+      default: 1.0
+      selector:
+        number:
+          min: 0
+          max: 6
+          step: 0.25
+          unit_of_measurement: u
+          mode: slider
+    max_discharge_power:
+      name: Maximaal ontlaadvermogen (W)
+      default: 2400
+      selector:
+        number:
+          min: 100
+          max: 5000
+          step: 50
+          unit_of_measurement: W
+          mode: box
+
+    enable_boolean:
+      name: (Optioneel) input_boolean om automation aan/uit te zetten
+      description: Laat leeg om altijd actief te zijn
+      default:
+      selector:
+        entity:
+          domain: input_boolean
+          multiple: false
+
+mode: single
+max_exceeded: silent
+
+variables:
+  prices_sensor: !input prices_sensor
+  prices_attribute: !input prices_attribute
+  mode_select: !input usage_mode_select
+  smart_opt: !input smart_mode_option
+  manual_opt: !input manual_mode_option
+  output_number: !input output_preset_number
+  backup_switch: !input backup_option_switch
+  export_switch: !input grid_export_switch
+  charge_before_h: !input charge_hours_before
+  charge_after_h: !input charge_hours_after
+  discharge_before_h: !input discharge_hours_before
+  discharge_after_h: !input discharge_hours_after
+  max_w: !input max_discharge_power
+  enable_helper: !input enable_boolean
+
+trigger:
+  - platform: time_pattern
+    minutes: "/1"
+  - platform: state
+    entity_id: !input prices_sensor
+
+action:
+  - variables:
+      prices: "{{ state_attr(prices_sensor, prices_attribute) }}"
+      cheap_iso: >-
+        {% if prices and prices | length > 0 %}
+          {{ (prices | sort(attribute='price') | first).start }}
+        {% else %}
+          {{ none }}
+        {% endif %}
+      exp_iso: >-
+        {% if prices and prices | length > 0 %}
+          {{ (prices | sort(attribute='price', reverse=true) | first).start }}
+        {% else %}
+          {{ none }}
+        {% endif %}
+      now_ts: "{{ now().timestamp() }}"
+      cheap_ts: "{{ as_timestamp(cheap_iso) if cheap_iso not in [none, 'None'] else 0 }}"
+      exp_ts: "{{ as_timestamp(exp_iso) if exp_iso not in [none, 'None'] else 0 }}"
+      charge_before_s: "{{ (charge_before_h | float) * 3600 }}"
+      charge_after_s: "{{ (charge_after_h | float) * 3600 }}"
+      discharge_before_s: "{{ (discharge_before_h | float) * 3600 }}"
+      discharge_after_s: "{{ (discharge_after_h | float) * 3600 }}"
+      in_charge: >-
+        {{ cheap_ts > 0
+           and (cheap_ts - charge_before_s) <= now_ts
+           and now_ts <= (cheap_ts + charge_after_s) }}
+      in_discharge: >-
+        {{ exp_ts > 0
+           and (exp_ts - discharge_before_s) <= now_ts
+           and now_ts <= (exp_ts + discharge_after_s) }}
+      overlap: >-
+        {% if cheap_ts > 0 and exp_ts > 0 %}
+          {{ (cheap_ts - charge_before_s) < (exp_ts + discharge_after_s)
+             and (exp_ts - discharge_before_s) < (cheap_ts + charge_after_s) }}
+        {% else %}
+          false
+        {% endif %}
+      enabled: >-
+        {% if enable_helper in [none, '', 'None'] %}
+          true
+        {% else %}
+          {{ is_state(enable_helper, 'on') }}
+        {% endif %}
+      target: >-
+        {% if not enabled or overlap %}smart
+        {% elif in_charge %}charge
+        {% elif in_discharge %}discharge
+        {% else %}smart
+        {% endif %}
+      cur_mode: "{{ states(mode_select) }}"
+      cur_backup: "{{ states(backup_switch) }}"
+      cur_export: "{{ states(export_switch) }}"
+      cur_output: "{{ states(output_number) | float(-1) }}"
+
+  - choose:
+      # -----------------------------------------------------------------
+      # LADEN: alleen ingrijpen als nog niet in de juiste stand
+      # -----------------------------------------------------------------
+      - conditions:
+          - condition: template
+            value_template: >-
+              {{ target == 'charge'
+                 and not (cur_mode == manual_opt
+                          and cur_backup == 'on'
+                          and cur_export == 'off'
+                          and cur_output == 0) }}
+        sequence:
+          - service: select.select_option
+            target:
+              entity_id: !input usage_mode_select
+            data:
+              option: !input manual_mode_option
+          - delay: "00:00:02"
+          - service: switch.turn_off
+            target:
+              entity_id: !input grid_export_switch
+          - service: number.set_value
+            target:
+              entity_id: !input output_preset_number
+            data:
+              value: 0
+          - service: switch.turn_on
+            target:
+              entity_id: !input backup_option_switch
+          - service: logbook.log
+            data:
+              name: Anker Solix Blueprint
+              message: >-
+                LADEN gestart (€{{ (prices | selectattr('start', 'eq', cheap_iso) | first).price | round(4) if cheap_iso else '?' }}/kWh)
+                — venster {{ (cheap_ts - charge_before_s) | timestamp_custom('%H:%M') }} t/m {{ (cheap_ts + charge_after_s) | timestamp_custom('%H:%M') }}
+              entity_id: !input backup_option_switch
+
+      # -----------------------------------------------------------------
+      # ONTLADEN: alleen ingrijpen als nog niet in de juiste stand
+      # -----------------------------------------------------------------
+      - conditions:
+          - condition: template
+            value_template: >-
+              {{ target == 'discharge'
+                 and not (cur_mode == manual_opt
+                          and cur_export == 'on'
+                          and cur_backup == 'off'
+                          and cur_output == (max_w | float)) }}
+        sequence:
+          - service: select.select_option
+            target:
+              entity_id: !input usage_mode_select
+            data:
+              option: !input manual_mode_option
+          - delay: "00:00:02"
+          - service: switch.turn_off
+            target:
+              entity_id: !input backup_option_switch
+          - service: switch.turn_on
+            target:
+              entity_id: !input grid_export_switch
+          - service: number.set_value
+            target:
+              entity_id: !input output_preset_number
+            data:
+              value: !input max_discharge_power
+          - service: logbook.log
+            data:
+              name: Anker Solix Blueprint
+              message: >-
+                ONTLADEN MAX {{ max_w }} W (€{{ (prices | selectattr('start', 'eq', exp_iso) | first).price | round(4) if exp_iso else '?' }}/kWh)
+                — venster {{ (exp_ts - discharge_before_s) | timestamp_custom('%H:%M') }} t/m {{ (exp_ts + discharge_after_s) | timestamp_custom('%H:%M') }}
+              entity_id: !input grid_export_switch
+
+      # -----------------------------------------------------------------
+      # SMART: alleen ingrijpen als de Solarbank nog niet in smart staat
+      # -----------------------------------------------------------------
+      - conditions:
+          - condition: template
+            value_template: >-
+              {{ target == 'smart'
+                 and (cur_mode != smart_opt
+                      or cur_backup == 'on'
+                      or cur_export == 'on') }}
+        sequence:
+          - service: switch.turn_off
+            target:
+              entity_id: !input backup_option_switch
+          - service: switch.turn_off
+            target:
+              entity_id: !input grid_export_switch
+          - service: select.select_option
+            target:
+              entity_id: !input usage_mode_select
+            data:
+              option: !input smart_mode_option
+          - service: logbook.log
+            data:
+              name: Anker Solix Blueprint
+              message: "SMART modus hersteld"
+              entity_id: !input usage_mode_select
